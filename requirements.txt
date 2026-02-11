@@ -1,0 +1,4 @@
+streamlit
+psycopg[binary]
+passlib[argon2]
+argon2-cffi
