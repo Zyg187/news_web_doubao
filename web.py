@@ -1,35 +1,31 @@
 import secrets
 from typing import Any, Dict, Optional, Tuple
 
-import mysql.connector
+import psycopg
 import streamlit as st
 from passlib.context import CryptContext
 
-# -------------------------
-# 配置区：改成你的 MySQL 连接信息
-# -------------------------
-MYSQL_HOST = "127.0.0.1"
-MYSQL_PORT = 3306
-MYSQL_USER = "root"
-MYSQL_PASSWORD = "zyg520..."
-MYSQL_DATABASE = "news_app"
+# =========================================================
+# Supabase(Postgres) 配置：从 Streamlit Secrets 读取
+# 在 Streamlit Community Cloud -> Settings -> Secrets 中配置：
+#
+# [pg]
+# dsn = "postgresql://USER:PASSWORD@aws-0-xxx.pooler.supabase.com:6543/postgres"
+#
+# 强烈建议使用 Supabase 的 Connection Pooler（Transaction pooler）。
+# =========================================================
+PG_DSN = st.secrets["pg"]["dsn"]
 
 pwd_context = CryptContext(schemes=["argon2"], deprecated="auto")
 
 
 def get_conn():
-    return mysql.connector.connect(
-        host=MYSQL_HOST,
-        port=MYSQL_PORT,
-        user=MYSQL_USER,
-        password=MYSQL_PASSWORD,
-        database=MYSQL_DATABASE,
-        autocommit=True,
-    )
+    # psycopg3，autocommit=True 避免每次都显式 commit
+    return psycopg.connect(PG_DSN, autocommit=True)
 
 
 # -------------------------
-# 配置常量
+# 配置常量（统一 time_range 值）
 # -------------------------
 TIME_RANGE_OPTIONS = [
     ("1天内", "1day"),
@@ -38,7 +34,7 @@ TIME_RANGE_OPTIONS = [
 ]
 
 DEFAULT_CFG: Dict[str, Any] = {
-    "time_range": "7d",
+    "time_range": "7day",
     "output_format": "标题 | 时间 | 摘要 | 来源 | 链接",
     "query": "",
     "rounds": 2,
@@ -74,7 +70,7 @@ def _normalize_cfg(cfg: Dict[str, Any]) -> Dict[str, Any]:
 
 
 # -------------------------
-# 用户相关：注册/登录（改：用 employee 表）
+# 用户相关：注册/登录（employee 表）
 # -------------------------
 def create_user(employee_id: str, real_name: str, password: str) -> Tuple[bool, str]:
     employee_id = employee_id.strip()
@@ -86,31 +82,30 @@ def create_user(employee_id: str, real_name: str, password: str) -> Tuple[bool, 
 
     # 注册时同时写入默认配置
     cfg = _normalize_cfg({})
+
     try:
-        conn = get_conn()
-        cur = conn.cursor()
-        cur.execute(
-            """
-            INSERT INTO employee
-              (employee_id, real_name, password_hash, time_range, output_format, query, rounds, show_thinking)
-            VALUES
-              (%s, %s, %s, %s, %s, %s, %s, %s)
-            """,
-            (
-                employee_id,
-                real_name,
-                password_hash,
-                cfg["time_range"],
-                cfg["output_format"],
-                cfg["query"],
-                int(cfg["rounds"]),
-                1 if cfg["show_thinking"] else 0,
-            ),
-        )
-        cur.close()
-        conn.close()
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO public.employee
+                      (employee_id, real_name, password_hash, time_range, output_format, query, rounds, show_thinking)
+                    VALUES
+                      (%s, %s, %s, %s, %s, %s, %s, %s)
+                    """,
+                    (
+                        employee_id,
+                        real_name,
+                        password_hash,
+                        cfg["time_range"],
+                        cfg["output_format"],
+                        cfg["query"],
+                        int(cfg["rounds"]),
+                        bool(cfg["show_thinking"]),  # Postgres boolean
+                    ),
+                )
         return True, "注册成功"
-    except mysql.connector.errors.IntegrityError:
+    except psycopg.errors.UniqueViolation:
         return False, "该工号已注册"
     except Exception as e:
         return False, f"注册失败：{e}"
@@ -122,44 +117,42 @@ def authenticate(employee_id: str, password: str) -> Tuple[bool, Optional[int], 
         return False, None, "工号/密码不能为空"
 
     try:
-        conn = get_conn()
-        cur = conn.cursor()
-        cur.execute(
-            "SELECT id, password_hash FROM employee WHERE employee_id = %s",
-            (employee_id,),
-        )
-        row = cur.fetchone()
-        cur.close()
-        conn.close()
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT id, password_hash FROM public.employee WHERE employee_id = %s",
+                    (employee_id,),
+                )
+                row = cur.fetchone()
 
         if not row:
             return False, None, "工号不存在"
+
         user_id, password_hash = row
         if not pwd_context.verify(password, password_hash):
             return False, None, "密码错误"
+
         return True, int(user_id), "登录成功"
     except Exception as e:
         return False, None, f"登录失败：{e}"
 
 
 # -------------------------
-# 配置相关：读取/保存（改：从 employee 表直接读写列）
+# 配置相关：读取/保存（employee 表）
 # -------------------------
 def load_user_config(user_id: int) -> Dict[str, Any]:
     try:
-        conn = get_conn()
-        cur = conn.cursor()
-        cur.execute(
-            """
-            SELECT time_range, output_format, query, rounds, show_thinking
-            FROM employee
-            WHERE id = %s
-            """,
-            (user_id,),
-        )
-        row = cur.fetchone()
-        cur.close()
-        conn.close()
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT time_range, output_format, query, rounds, show_thinking
+                    FROM public.employee
+                    WHERE id = %s
+                    """,
+                    (user_id,),
+                )
+                row = cur.fetchone()
 
         if not row:
             return dict(DEFAULT_CFG)
@@ -180,25 +173,23 @@ def save_user_config(user_id: int, cfg: Dict[str, Any]) -> Tuple[bool, str]:
     try:
         normalized = _normalize_cfg(cfg)
 
-        conn = get_conn()
-        cur = conn.cursor()
-        cur.execute(
-            """
-            UPDATE employee
-            SET time_range=%s, output_format=%s, query=%s, rounds=%s, show_thinking=%s
-            WHERE id=%s
-            """,
-            (
-                normalized["time_range"],
-                normalized["output_format"],
-                normalized["query"],
-                int(normalized["rounds"]),
-                1 if normalized["show_thinking"] else 0,
-                user_id,
-            ),
-        )
-        cur.close()
-        conn.close()
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE public.employee
+                    SET time_range=%s, output_format=%s, query=%s, rounds=%s, show_thinking=%s
+                    WHERE id=%s
+                    """,
+                    (
+                        normalized["time_range"],
+                        normalized["output_format"],
+                        normalized["query"],
+                        int(normalized["rounds"]),
+                        bool(normalized["show_thinking"]),  # Postgres boolean
+                        user_id,
+                    ),
+                )
         return True, "保存成功"
     except Exception as e:
         return False, f"保存失败：{e}"
@@ -339,7 +330,7 @@ def render_config():
 
     # 总览实时值
     def _label_time_range(v: str) -> str:
-        return {"1d": "1天内", "7d": "7天内", "30d": "30天内"}.get(v, v)
+        return {"1day": "1天内", "7day": "7天内", "30day": "30天内"}.get(v, v)
 
     summary_time = _label_time_range(st.session_state["cfg_time_range"])
     summary_rounds = str(st.session_state["cfg_rounds"])
